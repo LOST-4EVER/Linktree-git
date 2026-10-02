@@ -2,17 +2,54 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
     <title>GitTree Linkhub</title>
-    <meta name="description" content="Production-ready, lightweight Linktree alternative with secret admin mode and direct GitHub API synchronization." />
+    <meta
+      name="description"
+      content="A lightweight, self-hosted link-in-bio. Edit your profile and links, then publish straight to GitHub — no build step required."
+    />
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="color-scheme" content="dark light" />
+
+    <meta property="og:type" content="profile" />
     <meta property="og:title" content="GitTree Linkhub" />
-    <meta property="og:description" content="Production-ready, lightweight Linktree alternative with secret admin mode and direct GitHub API synchronization." />
-    <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      property="og:description"
+      content="A lightweight, self-hosted link-in-bio. Edit your profile and links, then publish straight to GitHub."
+    />
+    <meta property="og:image" content="/avatar.jpg" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="GitTree Linkhub" />
+    <meta
+      name="twitter:description"
+      content="A lightweight, self-hosted link-in-bio. Edit your profile and links, then publish straight to GitHub."
+    />
+    <meta name="twitter:image" content="/avatar.jpg" />
+
+    <link rel="icon" type="image/jpeg" href="/avatar.jpg" />
+    <link rel="apple-touch-icon" href="/avatar.jpg" />
+
+    <!-- Paint the themed background before React mounts, avoiding a white flash. -->
+    <style>
+      html,
+      body,
+      #root {
+        min-height: 100%;
+      }
+      body {
+        margin: 0;
+        background-color: #0f172a;
+      }
+      @media (prefers-color-scheme: light) {
+        body {
+          background-color: #ffffff;
+        }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

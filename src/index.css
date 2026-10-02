@@ -1,1 +1,154 @@
 @import "tailwindcss";
+
+/* ------------------------------------------------------------------ *
+ * GitTree design tokens
+ * ------------------------------------------------------------------ */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ------------------------------------------------------------------ *
+ * Base
+ * ------------------------------------------------------------------ */
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overscroll-behavior-y: none;
+  }
+
+  /* A single, consistent focus ring across the whole admin UI. */
+  :focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--color-indigo-400) 85%, transparent);
+    outline-offset: 2px;
+    border-radius: 0.375rem;
+  }
+
+  /* Remove the number spinners that eat horizontal space in color inputs. */
+  input[type="color"] {
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  input[type="color"]::-webkit-color-swatch-wrapper {
+    padding: 0;
+  }
+  input[type="color"]::-webkit-color-swatch {
+    border: none;
+    border-radius: 0.25rem;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Utilities used across components
+ * ------------------------------------------------------------------ */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* `backdrop-blur-xs` is used in the admin overlays; Tailwind v4 does not
+   ship an `xs` blur step, so define it explicitly. */
+@utility backdrop-blur-xs {
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+/* `safe-bottom` keeps the drawer's action bar above the iOS home indicator. */
+@utility safe-bottom {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+/* Entrance animation for the icon picker and other bottom sheets. */
+@utility animate-in {
+  animation: gt-fade-in 200ms ease-out both;
+}
+
+@keyframes gt-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@utility slide-in-from-bottom {
+  animation: gt-slide-up 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes gt-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@utility slide-in-from-right {
+  animation: gt-slide-right 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes gt-slide-right {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Scrollbars (admin drawer + modals)
+ * ------------------------------------------------------------------ */
+@layer components {
+  .gt-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, #64748b 55%, transparent) transparent;
+  }
+  .gt-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .gt-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .gt-scroll::-webkit-scrollbar-thumb {
+    background-color: color-mix(in oklab, #64748b 50%, transparent);
+    border-radius: 9999px;
+  }
+  .gt-scroll::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in oklab, #94a3b8 70%, transparent);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Motion preferences
+ * ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

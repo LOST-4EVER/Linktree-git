@@ -1,20 +1,51 @@
 import { GitHubConfig, LinktreeData } from '../types/linktree';
+import { toPublishableData } from '../utils/data';
 
-// In-memory SHA cache to reduce redundant GET roundtrips
-const shaCache = new Map<string, { sha: string; timestamp: number }>();
+/** Every network call is bounded so the UI can never hang on a dead connection. */
+const REQUEST_TIMEOUT_MS = 15000;
+
+/** SHA cache TTL. Short: a stale SHA causes a 409, which costs an extra request. */
+const SHA_CACHE_TTL_MS = 10000;
+
+interface ShaCacheEntry {
+  sha: string | null;
+  timestamp: number;
+}
+
+const shaCache = new Map<string, ShaCacheEntry>();
 
 function getCacheKey(config: GitHubConfig): string {
-  return `${config.owner.toLowerCase()}/${config.repo.toLowerCase()}/${config.filePath}/${config.branch || 'main'}`;
+  return [
+    config.owner.toLowerCase(),
+    config.repo.toLowerCase(),
+    config.filePath.replace(/^\//, ''),
+    config.branch || 'main',
+  ].join('/');
+}
+
+function stripLeadingSlash(filePath: string): string {
+  return (filePath ?? '').replace(/^\/+/, '');
+}
+
+/** Escapes a path so special characters do not break the URL structure. */
+function encodePathSegments(filePath: string): string {
+  return stripLeadingSlash(filePath)
+    .split('/')
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join('/');
 }
 
 /**
- * Encodes a UTF-8 string to Base64 safely in browser environments without Unicode corruption.
+ * Encodes a UTF-8 string to Base64 safely in browser environments without
+ * Unicode corruption. Chunked because String.fromCharCode.apply blows the
+ * argument limit on large payloads.
  */
 export function encodeUtf8ToBase64(str: string): string {
   const utf8Bytes = new TextEncoder().encode(str);
   let binary = '';
   const len = utf8Bytes.byteLength;
-  const CHUNK_SZ = 0x8000; // 32KB chunking for performance
+  const CHUNK_SZ = 0x8000;
   for (let i = 0; i < len; i += CHUNK_SZ) {
     binary += String.fromCharCode.apply(
       null,
@@ -24,9 +55,7 @@ export function encodeUtf8ToBase64(str: string): string {
   return btoa(binary);
 }
 
-/**
- * Decodes Base64 to a UTF-8 string safely in browser environments.
- */
+/** Decodes Base64 to a UTF-8 string safely in browser environments. */
 export function decodeBase64ToUtf8(base64: string): string {
   const binaryString = atob(base64.replace(/\s/g, ''));
   const len = binaryString.length;
@@ -37,36 +66,128 @@ export function decodeBase64ToUtf8(base64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+interface GitHubError {
+  message: string;
+  documentationUrl?: string;
+  /** Seconds until the rate limit resets, when GitHub reports it. */
+  resetSeconds?: number;
+}
+
 /**
- * Fetches the current file blob SHA and content from GitHub.
- * Uses intelligent short-lived cache and checks GitHub if needed.
+ * Turns a non-2xx GitHub response into a message that tells the user what to
+ * actually do. Raw GitHub messages are frequently unhelpful for token issues.
+ */
+async function describeError(res: Response, context: string): Promise<GitHubError> {
+  const body = (await res.json().catch(() => ({}))) as {
+    message?: string;
+    documentation_url?: string;
+  };
+
+  const rateLimitRemaining = res.headers.get('x-ratelimit-remaining');
+  const rateLimitReset = res.headers.get('x-ratelimit-reset');
+
+  if (res.status === 401) {
+    return {
+      message:
+        'Authentication failed (401). Your token was rejected — check that it is valid and not expired.',
+    };
+  }
+
+  if (res.status === 403) {
+    if (rateLimitRemaining === '0') {
+      const resetAt = rateLimitReset ? Number(rateLimitReset) * 1000 : 0;
+      const minutes = resetAt ? Math.max(1, Math.ceil((resetAt - Date.now()) / 60000)) : null;
+      return {
+        message: minutes
+          ? `GitHub API rate limit reached (403). Try again in about ${minutes} minute${
+              minutes === 1 ? '' : 's'
+            }.`
+          : 'GitHub API rate limit reached (403). Try again shortly.',
+        documentationUrl: 'https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api',
+      };
+    }
+    return {
+      message: `Forbidden (403) while ${context}. The token is missing the required permissions, or branch protection is blocking writes.`,
+    };
+  }
+
+  if (res.status === 404) {
+    return { message: `Not found (404) while ${context}. Check the repository, branch, and file path.` };
+  }
+
+  if (res.status === 422) {
+    return {
+      message: `Validation failed (422) while ${context}. ${body.message || 'The request was rejected as invalid.'}`,
+    };
+  }
+
+  return {
+    message: body.message || `${context} failed (HTTP ${res.status}).`,
+    documentationUrl: body.documentation_url,
+  };
+}
+
+function authHeaders(token: string): HeadersInit {
+  return {
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${token.trim()}`,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+/** fetch with an AbortController-based timeout. */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = REQUEST_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if ((err as Error)?.name === 'AbortError') {
+      throw new Error('GitHub request timed out. Check your connection and try again.');
+    }
+    throw new Error(
+      'Could not reach the GitHub API. Check your connection, then try again.'
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface GitHubFileInfo {
+  sha: string | null;
+  exists: boolean;
+}
+
+/**
+ * Fetches the current file blob SHA from GitHub, with a short-lived cache.
+ * Returns exists=false when the file has not been created yet.
  */
 export async function getGitHubFileSha(
   config: GitHubConfig,
   forceFresh = false
-): Promise<{ sha: string | null; exists: boolean }> {
+): Promise<GitHubFileInfo> {
   const cacheKey = getCacheKey(config);
   const cached = shaCache.get(cacheKey);
 
-  // If cached within the last 15 seconds and not forcing fresh, return cached SHA
-  if (!forceFresh && cached && Date.now() - cached.timestamp < 15000) {
+  if (
+    !forceFresh &&
+    cached &&
+    cached.sha &&
+    Date.now() - cached.timestamp < SHA_CACHE_TTL_MS
+  ) {
     return { sha: cached.sha, exists: true };
   }
 
   const { token, owner, repo, branch, filePath } = config;
-  const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}?ref=${encodeURIComponent(
-    branch || 'main'
-  )}`;
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodePathSegments(
+    filePath
+  )}?ref=${encodeURIComponent(branch || 'main')}`;
 
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${token.trim()}`,
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
-  });
+  const res = await fetchWithTimeout(url, { method: 'GET', headers: authHeaders(token) });
 
   if (res.status === 404) {
     shaCache.delete(cacheKey);
@@ -74,64 +195,53 @@ export async function getGitHubFileSha(
   }
 
   if (!res.ok) {
-    const errorBody = await res.json().catch(() => ({}));
-    const message = errorBody.message || `Failed to fetch file SHA (HTTP ${res.status})`;
-    throw new Error(message);
+    const error = await describeError(res, 'fetching the file SHA');
+    throw new Error(error.message);
   }
 
   const data = await res.json();
-  const sha = data.sha || null;
-  if (sha) {
-    shaCache.set(cacheKey, { sha, timestamp: Date.now() });
-  }
+  const sha = typeof data?.sha === 'string' ? data.sha : null;
+  shaCache.set(cacheKey, { sha, timestamp: Date.now() });
   return { sha, exists: true };
 }
 
-/**
- * Verifies repository access and token permissions.
- */
-export async function verifyGitHubRepo(config: GitHubConfig): Promise<{
+export interface RepoVerification {
   valid: boolean;
   defaultBranch?: string;
   isPrivate?: boolean;
+  /** Whether the token can push, based on the repo's reported permissions. */
+  canPush?: boolean;
   error?: string;
-}> {
+}
+
+/**
+ * Verifies repository access and reports the token's write permission, so the
+ * settings tab can warn before a publish attempt fails.
+ */
+export async function verifyGitHubRepo(config: GitHubConfig): Promise<RepoVerification> {
   const { token, owner, repo } = config;
-  if (!token || !owner || !repo) {
-    return { valid: false, error: 'Token, Owner, and Repo are required.' };
+  if (!token.trim() || !owner.trim() || !repo.trim()) {
+    return { valid: false, error: 'Token, Owner, and Repo are all required.' };
   }
 
-  const url = `https://api.github.com/repos/${owner}/${repo}`;
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner.trim())}/${encodeURIComponent(
+    repo.trim()
+  )}`;
 
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token.trim()}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
+    const res = await fetchWithTimeout(url, { method: 'GET', headers: authHeaders(token) });
 
-    if (res.status === 401) {
-      return { valid: false, error: 'Bad credentials: Check your Personal Access Token (PAT).' };
-    }
-    if (res.status === 404) {
-      return {
-        valid: false,
-        error: `Repository '${owner}/${repo}' not found or token lacks 'repo' scope access.`,
-      };
-    }
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      return { valid: false, error: err.message || `GitHub returned HTTP ${res.status}` };
+      const error = await describeError(res, 'verifying repository access');
+      return { valid: false, error: error.message };
     }
 
     const data = await res.json();
     return {
       valid: true,
-      defaultBranch: data.default_branch,
-      isPrivate: data.private,
+      defaultBranch: data?.default_branch,
+      isPrivate: data?.private,
+      canPush: data?.permissions?.push === true,
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Network error verifying repository';
@@ -139,32 +249,39 @@ export async function verifyGitHubRepo(config: GitHubConfig): Promise<{
   }
 }
 
-/**
- * Commits updated Linktree data to the GitHub repository using the GitHub Contents API.
- * Includes performance metrics (duration, byte size), conflict auto-retry, and SHA caching.
- */
-export async function commitDataToGitHub(
-  config: GitHubConfig,
-  data: LinktreeData,
-  customMessage?: string
-): Promise<{
+export interface CommitResult {
   success: boolean;
   commitUrl?: string;
   sha?: string;
   durationMs: number;
   payloadBytes: number;
-}> {
+}
+
+/**
+ * Commits the Linktree data to GitHub via the Contents API, with SHA-conflict
+ * auto-retry. Click counts are stripped so they never produce diff noise.
+ */
+export async function commitDataToGitHub(
+  config: GitHubConfig,
+  data: LinktreeData,
+  customMessage?: string
+): Promise<CommitResult> {
   const startTime = performance.now();
   const { token, owner, repo, branch, filePath } = config;
-  const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;
-  const cacheKey = getCacheKey(config);
 
-  // Step 1: Format and Base64-encode the payload
-  const formattedJson = JSON.stringify(data, null, 2);
+  if (!token.trim() || !owner.trim() || !repo.trim()) {
+    throw new Error('A GitHub token, owner, and repository are required to publish.');
+  }
+
+  const cacheKey = getCacheKey(config);
+  const targetBranch = (branch || 'main').trim();
+  const encodedPath = encodePathSegments(filePath);
+
+  // Format and encode the payload.
+  const formattedJson = JSON.stringify(toPublishableData(data), null, 2);
   const payloadBytes = new TextEncoder().encode(formattedJson).length;
   const base64Content = encodeUtf8ToBase64(formattedJson);
 
-  // Step 2: Retrieve existing SHA
   let { sha: currentSha } = await getGitHubFileSha(config);
 
   const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -179,72 +296,58 @@ export async function commitDataToGitHub(
   } = {
     message: commitMessage,
     content: base64Content,
-    branch: branch || 'main',
+    branch: targetBranch,
   };
 
   if (currentSha) {
     commitPayload.sha = currentSha;
   }
 
-  const putUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`;
-
-  // Execute PUT request
-  let res = await fetch(putUrl, {
+  const putUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+  const putInit: RequestInit = {
     method: 'PUT',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${token.trim()}`,
-      'Content-Type': 'application/json',
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
+    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify(commitPayload),
-  });
+  };
 
-  // Step 3: Conflict Recovery (409 Conflict): If SHA was outdated, fetch fresh SHA and retry once
+  let res = await fetchWithTimeout(putUrl, putInit);
+
+  // Conflict recovery: our SHA was stale, so refetch and retry exactly once.
   if (res.status === 409) {
     const fresh = await getGitHubFileSha(config, true);
     if (fresh.sha) {
       commitPayload.sha = fresh.sha;
-      res = await fetch(putUrl, {
-        method: 'PUT',
-        headers: {
-          Accept: 'application/vnd.github+json',
-          Authorization: `Bearer ${token.trim()}`,
-          'Content-Type': 'application/json',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
-        body: JSON.stringify(commitPayload),
-      });
+      res = await fetchWithTimeout(putUrl, putInit);
     }
   }
 
   if (!res.ok) {
-    const errorBody = await res.json().catch(() => ({}));
-    let msg = errorBody.message || `Failed to commit to GitHub (HTTP ${res.status})`;
+    const error = await describeError(res, 'committing to GitHub');
     if (res.status === 409) {
-      msg = 'Conflict detected: The file was updated on GitHub. Please refresh and try again.';
-    } else if (res.status === 401) {
-      msg = 'Authentication failed. Please verify your Personal Access Token in settings.';
-    } else if (res.status === 404) {
-      msg = `Repository '${owner}/${repo}' or branch '${branch}' not found.`;
+      throw new Error(
+        'Conflict detected: data.json was updated on GitHub at the same time. Reload and publish again.'
+      );
     }
-    throw new Error(msg);
+    throw new Error(error.message);
   }
 
   const result = await res.json();
-  const newSha = result.content?.sha;
+  const newSha = result?.content?.sha;
 
   if (newSha) {
     shaCache.set(cacheKey, { sha: newSha, timestamp: Date.now() });
   }
 
-  const durationMs = Math.round(performance.now() - startTime);
-
   return {
     success: true,
-    commitUrl: result.commit?.html_url,
+    commitUrl: result?.commit?.html_url,
     sha: newSha,
-    durationMs,
+    durationMs: Math.round(performance.now() - startTime),
     payloadBytes,
   };
+}
+
+/** Clears cached SHAs, e.g. after switching repositories. */
+export function clearGitHubShaCache(): void {
+  shaCache.clear();
 }

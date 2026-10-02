@@ -1,35 +1,58 @@
 import { LinktreeData } from '../types/linktree';
+import { normalizeLinktreeData, toPublishableData } from './data';
+
+/**
+ * Escapes text for safe interpolation into HTML text nodes and attributes.
+ * Without this, a bio containing `<script>` becomes live markup.
+ */
+function escapeHtml(value: string): string {
+  return (value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Serializes data for embedding inside a <script> block.
+ * `</script>` inside a string literal terminates the block early, and the JS
+ * engine then chokes on the rest of the document, so `<` is escaped as a
+ * unicode escape. Same for U+2028/U+2029, which are invalid in JS strings.
+ */
+function serializeForScript(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
 
 /**
  * Generates the complete, self-contained single-file `index.html` Linktree alternative
  * using HTML5, Tailwind CSS (via CDN), and Vanilla JavaScript.
  */
-export function generateStandaloneHtml(initialData: LinktreeData): string {
-  const serializedInitial = JSON.stringify(initialData, null, 2);
+export function generateStandaloneHtml(rawData: LinktreeData): string {
+  // Normalize first: the exported page renders without the React runtime's
+  // safety nets, so it must not depend on a well-formed payload.
+  const initialData = toPublishableData(normalizeLinktreeData(rawData));
+  const serializedInitial = serializeForScript(initialData);
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>${initialData.profile.name || 'Linktree Alternative'}</title>
-  <meta name="description" content="${(initialData.profile.bio || 'Linktree alternative').replace(/"/g, '&quot;')}">
-  <!-- Tailwind CSS CDN -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          fontFamily: {
-            sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
-            serif: ['Georgia', 'Cambria', 'serif'],
-            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace']
-          }
-        }
-      }
-    };
-  </script>
+  <title>${escapeHtml(initialData.profile.name || 'Linktree Alternative')}</title>
+  <meta name="description" content="${escapeHtml(initialData.profile.bio || 'Linktree alternative')}">
+  <meta property="og:title" content="${escapeHtml(initialData.profile.name || 'Linktree Alternative')}">
+  <meta property="og:description" content="${escapeHtml(initialData.profile.bio || 'Linktree alternative')}">
+  <meta property="og:type" content="profile">
+  <meta name="twitter:card" content="summary">
+  <meta name="theme-color" content="#0f172a">
+  <!-- Tailwind CSS v4 browser build: the v3 Play CDN is deprecated and would
+       render the custom utilities below incorrectly. -->
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
   <style>
     /* Smooth transition for theme backgrounds and glassmorphism */
     .glass-surface {
@@ -43,6 +66,13 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
     ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.8); }
     /* Touch optimization */
     button, a { touch-action: manipulation; }
+    /* Honor reduced-motion preferences */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   </style>
 </head>
 <body class="min-h-screen antialiased transition-colors duration-500 flex flex-col justify-between selection:bg-indigo-500/30">
@@ -267,7 +297,53 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
     };
 
     function utf8ToBase64(str) {
-      return window.btoa(unescape(encodeURIComponent(str)));
+      const bytes = new TextEncoder().encode(str);
+      let binary = '';
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      return window.btoa(binary);
+    }
+
+    /* Only http/https/mailto/tel may become an href. Anything else
+       (javascript:, data:) is rendered as inert text instead. */
+    const SAFE_PROTOCOLS = ['http:', 'https:', 'mailto:', 'tel:'];
+
+    function safeUrl(raw) {
+      const value = String(raw == null ? '' : raw).trim();
+      if (!value) return null;
+      if (value.startsWith('/') || value.startsWith('#')) return value;
+      const match = /^([a-z][a-z0-9+.-]*):/i.exec(value);
+      if (!match) return 'https://' + value;
+      return SAFE_PROTOCOLS.indexOf(match[1].toLowerCase() + ':') !== -1 ? value : null;
+    }
+
+    /* Escapes text before it is placed into innerHTML. */
+    function escapeHtml(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function displayHost(raw) {
+      const safe = safeUrl(raw);
+      if (!safe || safe.charAt(0) === '/' || safe.charAt(0) === '#') return '';
+      try {
+        return new URL(safe).hostname.replace(/^www\\./, '');
+      } catch (e) {
+        return '';
+      }
+    }
+
+    function initials(name) {
+      const source = String(name || '').trim();
+      if (!source) return 'GT';
+      return source.split(/\\s+/).filter(Boolean).map(function (p) { return p.charAt(0); })
+        .slice(0, 2).join('').toUpperCase();
     }
 
     function renderPublic() {
@@ -284,14 +360,23 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
       containerEl.style.background = 'linear-gradient(135deg, ' + theme.accentColor + ', ' + theme.accentColor + '44)';
 
       if (profile.avatarUrl) {
-        avatarEl.src = profile.avatarUrl;
-        avatarEl.classList.remove('hidden');
-        fallbackEl.classList.add('hidden');
+        // Only render the img when the source is a plausible image reference.
+        if (/^(https?:|data:image)/i.test(profile.avatarUrl) || profile.avatarUrl.charAt(0) === '/') {
+          avatarEl.src = profile.avatarUrl;
+          avatarEl.alt = profile.name || 'Avatar';
+          avatarEl.classList.remove('hidden');
+          fallbackEl.classList.add('hidden');
+        } else {
+          avatarEl.classList.add('hidden');
+          fallbackEl.classList.remove('hidden');
+          fallbackEl.style.backgroundColor = theme.accentColor;
+          fallbackEl.textContent = initials(profile.name);
+        }
       } else {
         avatarEl.classList.add('hidden');
         fallbackEl.classList.remove('hidden');
         fallbackEl.style.backgroundColor = theme.accentColor;
-        fallbackEl.textContent = (profile.name || 'GT').slice(0, 2).toUpperCase();
+        fallbackEl.textContent = initials(profile.name);
       }
 
       const badgeEl = document.getElementById('verified-badge');
@@ -310,56 +395,104 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
       const socialsContainer = document.getElementById('socials-container');
       socialsContainer.innerHTML = '';
       (socials || []).forEach(social => {
+        if (!social || !social.url) return;
+        const href = safeUrl(social.url);
+        const surface = theme.buttonStyle === 'glass'
+          ? 'p-2.5 rounded-full transition-all duration-200 transform hover:scale-110 active:scale-95 bg-white/10 hover:bg-white/20 text-white backdrop-blur-sm'
+          : 'p-2.5 rounded-full transition-all duration-200 transform hover:scale-110 active:scale-95 bg-slate-900/80 hover:bg-slate-800 text-slate-200';
+        const label = escapeHtml(social.platform) + (displayHost(social.url) ? ' — ' + escapeHtml(displayHost(social.url)) : '');
+        const icon = SVG_ICONS[social.platform] || SVG_ICONS.globe;
+
+        // An unsafe URL renders as an inert, visibly-disabled chip.
+        if (!href) {
+          const span = document.createElement('span');
+          span.className = surface + ' opacity-40 cursor-not-allowed';
+          span.title = label + ' (invalid link)';
+          span.setAttribute('aria-disabled', 'true');
+          span.innerHTML = icon;
+          socialsContainer.appendChild(span);
+          return;
+        }
+
         const a = document.createElement('a');
-        a.href = social.url;
+        a.href = href;
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
-        a.className = 'p-2.5 rounded-full transition-all duration-200 transform hover:scale-110 active:scale-95 ' +
-          (theme.buttonStyle === 'glass' ? 'bg-white/10 hover:bg-white/20 text-white backdrop-blur-sm' : 'bg-slate-900/80 hover:bg-slate-800 text-slate-200');
-        a.innerHTML = SVG_ICONS[social.platform] || SVG_ICONS.globe;
+        a.className = surface;
+        a.setAttribute('aria-label', label);
+        a.title = label;
+        a.innerHTML = icon;
         socialsContainer.appendChild(a);
       });
 
       const linksContainer = document.getElementById('links-container');
       linksContainer.innerHTML = '';
-      (links || []).filter(l => l.active !== false).forEach(link => {
-        const a = document.createElement('a');
-        a.href = link.url;
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
+      (links || []).filter(function (l) { return l && l.active !== false; }).forEach(link => {
+        const href = safeUrl(link.url);
+        const accent = link.customAccent || theme.accentColor;
 
         let radius = 'rounded-2xl';
         if (theme.buttonStyle === 'pill') radius = 'rounded-full';
         if (theme.buttonStyle === 'rounded') radius = 'rounded-xl';
 
-        let surface = theme.buttonStyle === 'glass'
+        const surface = theme.buttonStyle === 'glass'
           ? (isDark ? 'bg-white/10 hover:bg-white/15 border border-white/15 text-white' : 'bg-white/80 hover:bg-white border border-slate-200 text-slate-900')
           : (isDark ? 'bg-slate-900/90 hover:bg-slate-800 border border-slate-800 text-slate-100' : 'bg-white hover:bg-slate-50 border border-slate-200 text-slate-900');
 
-        a.className = 'group relative flex items-center justify-between w-full px-4 sm:px-5 py-3.5 sm:py-4 transition-all duration-200 transform hover:-translate-y-0.5 min-h-[56px] ' + radius + ' ' + surface;
-        
-        a.onmouseenter = () => {
-          a.style.borderColor = theme.accentColor + '99';
-          a.style.boxShadow = '0 10px 25px -5px ' + theme.accentColor + '33';
-        };
-        a.onmouseleave = () => {
-          a.style.borderColor = '';
-          a.style.boxShadow = '';
-        };
+        const classes = 'group relative flex items-center justify-between w-full px-4 sm:px-5 py-3.5 sm:py-4 transition-all duration-200 transform hover:-translate-y-0.5 min-h-[56px] ' + radius + ' ' + surface;
 
         const iconHtml = SVG_ICONS[link.icon] || SVG_ICONS.globe;
-        const highlightHtml = link.highlight ? '<span class="absolute -top-2 right-4 text-[9px] sm:text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full text-white shadow-sm" style="background-color: ' + theme.accentColor + '">' + (link.badgeText || 'Featured') + '</span>' : '';
+        const highlightHtml = link.highlight
+          ? '<span class="absolute -top-2 right-4 text-[9px] sm:text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full text-white shadow-sm" style="background-color: ' + escapeHtml(accent) + '">' + escapeHtml(link.badgeText || 'Featured') + '</span>'
+          : '';
 
-        a.innerHTML = 
+        // Every interpolated value is escaped: title, subtitle and badge text
+        // are user-authored and would otherwise be parsed as markup.
+        const inner =
           highlightHtml +
-          '<div class="flex items-center justify-center w-10 h-10 shrink-0 rounded-xl bg-white/5">' + iconHtml + '</div>' +
+          '<div class="flex items-center justify-center w-10 h-10 shrink-0 rounded-xl" style="background-color: ' + escapeHtml(accent) + '1a">' + iconHtml + '</div>' +
           '<div class="flex-1 min-w-0 mx-3 sm:mx-4 text-center">' +
-            '<h3 class="text-xs sm:text-sm font-semibold truncate">' + link.title + '</h3>' +
-            (link.subtitle ? '<p class="text-[11px] sm:text-xs truncate opacity-70 mt-0.5">' + link.subtitle + '</p>' : '') +
+            '<h3 class="text-xs sm:text-sm font-semibold truncate">' + escapeHtml(link.title || 'Untitled') + '</h3>' +
+            (link.subtitle ? '<p class="text-[11px] sm:text-xs truncate opacity-70 mt-0.5">' + escapeHtml(link.subtitle) + '</p>' : '') +
           '</div>' +
           '<div class="flex items-center justify-center w-6 h-6 shrink-0 opacity-40 group-hover:opacity-100">' + SVG_ICONS.external + '</div>';
 
-        linksContainer.appendChild(a);
+        const host = displayHost(link.url);
+        const title = escapeHtml(link.title || 'Untitled') + (host ? ' — ' + escapeHtml(host) : '');
+
+        const el = document.createElement(href ? 'a' : 'div');
+        if (href) {
+          el.href = href;
+          el.target = '_blank';
+          el.rel = 'noopener noreferrer';
+          el.title = title;
+        } else {
+          el.className += ' cursor-not-allowed opacity-60';
+          el.title = title + ' (invalid link)';
+          el.setAttribute('aria-disabled', 'true');
+        }
+        el.className = classes;
+        el.innerHTML = inner;
+
+        if (link.highlight) {
+          el.style.borderColor = accent + '88';
+          el.style.boxShadow = '0 10px 25px -5px ' + accent + '25';
+        }
+        el.onmouseenter = function () {
+          el.style.borderColor = accent + '99';
+          el.style.boxShadow = '0 10px 25px -5px ' + accent + '33';
+        };
+        el.onmouseleave = function () {
+          if (link.highlight) {
+            el.style.borderColor = accent + '88';
+            el.style.boxShadow = '0 10px 25px -5px ' + accent + '25';
+          } else {
+            el.style.borderColor = '';
+            el.style.boxShadow = '';
+          }
+        };
+
+        linksContainer.appendChild(el);
       });
     }
 
@@ -369,7 +502,7 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
       avatarEl.classList.add('hidden');
       fallbackEl.classList.remove('hidden');
       fallbackEl.style.backgroundColor = state.theme.accentColor;
-      fallbackEl.textContent = (state.profile.name || 'GT').slice(0, 2).toUpperCase();
+      fallbackEl.textContent = initials(state.profile.name);
     }
 
     // Secret Admin Drawer Controls
@@ -430,15 +563,16 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
       (state.links || []).forEach((link, idx) => {
         const row = document.createElement('div');
         row.className = 'flex items-center justify-between p-3 rounded-xl bg-slate-900 border border-slate-800 text-xs';
+        // Titles and URLs are escaped: they are user-authored.
         row.innerHTML = 
           '<div class="flex-1 min-w-0 pr-2">' +
-            '<div class="font-semibold text-white truncate">' + link.title + '</div>' +
-            '<div class="text-slate-500 truncate font-mono text-[10px]">' + link.url + '</div>' +
+            '<div class="font-semibold text-white truncate">' + escapeHtml(link.title || 'Untitled') + '</div>' +
+            '<div class="text-slate-500 truncate font-mono text-[10px]">' + escapeHtml(link.url || 'No URL') + '</div>' +
           '</div>' +
           '<div class="flex items-center gap-1 shrink-0">' +
-            '<button onclick="moveLink(' + idx + ', -1)" class="p-2 text-slate-400 hover:text-white" title="Move Up">↑</button>' +
-            '<button onclick="moveLink(' + idx + ', 1)" class="p-2 text-slate-400 hover:text-white" title="Move Down">↓</button>' +
-            '<button onclick="deleteLink(' + idx + ')" class="p-2 text-rose-400 hover:text-rose-300" title="Delete">✕</button>' +
+            '<button onclick="moveLink(' + idx + ', -1)" class="p-2 text-slate-400 hover:text-white disabled:opacity-20" title="Move Up" aria-label="Move up">↑</button>' +
+            '<button onclick="moveLink(' + idx + ', 1)" class="p-2 text-slate-400 hover:text-white disabled:opacity-20" title="Move Down" aria-label="Move down">↓</button>' +
+            '<button onclick="deleteLink(' + idx + ')" class="p-2 text-rose-400 hover:text-rose-300" title="Delete" aria-label="Delete">✕</button>' +
           '</div>';
         listEl.appendChild(row);
       });
@@ -566,7 +700,8 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
             'Accept': 'application/vnd.github+json',
             'Authorization': 'Bearer ' + token,
             'X-GitHub-Api-Version': '2022-11-28'
-          }
+          },
+          signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined
         });
 
         if (getRes.ok) {
@@ -599,16 +734,27 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
             'Content-Type': 'application/json',
             'X-GitHub-Api-Version': '2022-11-28'
           },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined
+        }).catch(function (err) {
+          if (err && err.message && err.message.indexOf('GitHub') !== -1) throw err;
+          throw new Error('Could not reach the GitHub API. Check your connection and try again.');
         });
 
         if (!putRes.ok) {
           const errData = await putRes.json().catch(() => ({}));
+          if (putRes.status === 409) {
+            throw new Error('Conflict detected: data.json changed on GitHub at the same time. Reload and publish again.');
+          } else if (putRes.status === 401) {
+            throw new Error('Authentication failed (401). Check that your token is valid.');
+          } else if (putRes.status === 403 && putRes.headers.get('x-ratelimit-remaining') === '0') {
+            throw new Error('GitHub API rate limit reached. Try again in a few minutes.');
+          }
           throw new Error(errData.message || 'GitHub commit failed (HTTP ' + putRes.status + ')');
         }
 
         const putResult = await putRes.json();
-        showStatus('Committed successfully to GitHub! ' + (putResult.commit?.html_url ? '<a href="' + putResult.commit.html_url + '" target="_blank" class="underline">View Commit</a>' : ''), 'success');
+        showStatus('Committed successfully to GitHub!' + (putResult.commit?.html_url ? ' [View Commit](' + putResult.commit.html_url + ')' : ''), 'success');
       } catch (err) {
         showStatus(err.message || 'Commit failed.', 'error');
       }
@@ -624,7 +770,13 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
       } else {
         banner.classList.add('bg-slate-800', 'text-slate-300');
       }
-      banner.innerHTML = msg;
+      // The message may embed a commit link; anything else is escaped.
+      banner.innerHTML = escapeHtml(msg).replace(
+        /\\[([^\\]]+)\\]\\((https:\\/\\/[^)\\s]+)\\)/g,
+        function (_match, label, url) {
+          return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" class="underline">' + label + '</a>';
+        }
+      );
     }
 
     // Secret Mobile Triple-Tap Trigger
@@ -666,6 +818,8 @@ export function generateStandaloneHtml(initialData: LinktreeData): string {
         } else {
           closeAdmin();
         }
+      } else if (e.key === 'Escape' && !adminDrawer.classList.contains('translate-x-full')) {
+        closeAdmin();
       }
     });
 
