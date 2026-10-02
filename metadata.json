@@ -1,0 +1,6 @@
+{
+  "name": "GitTree Linkhub",
+  "description": "Production-ready, lightweight Linktree alternative with secret admin mode and direct GitHub API synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
